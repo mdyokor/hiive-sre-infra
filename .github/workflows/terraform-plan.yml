@@ -1,0 +1,69 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  plan:
+    name: Plan (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, uat, prod]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+        continue-on-error: true
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const plan = fs.readFileSync("environments/${{ matrix.environment }}/plan.txt", "utf8");
+            const truncated = plan.length > 60000 ? plan.slice(0, 60000) + "\n...(truncated)" : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "## Terraform Plan — `${{ matrix.environment }}`\n<details><summary>Show plan</summary>\n\n```\n" + truncated + "\n```\n</details>"
+            });
+
+      - name: Fail on plan error
+        if: steps.plan.outcome == "failure"
+        run: exit 1

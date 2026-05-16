@@ -1,0 +1,188 @@
+# .github/workflows/terraform.yml
+# ---------------------------------------------------------------------------
+# CI/CD pipeline:
+#   Pull Request  → terraform fmt check + validate + plan (all envs)
+#   Merge to main → auto-apply dev, manual approval gates for uat and prod
+# ---------------------------------------------------------------------------
+
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION:  "us-east-1"
+
+permissions:
+  id-token:       write   # OIDC authentication to AWS
+  contents:       read
+  pull-requests:  write   # Post plan output as PR comment
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Lint — runs on every PR and push
+  # -------------------------------------------------------------------------
+  lint:
+    name: Format & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt check
+        run: terraform fmt -check -recursive
+
+  # -------------------------------------------------------------------------
+  # Plan — runs on every PR for all three environments
+  # -------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.env }})
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, uat, prod]
+
+    environment: ${{ matrix.env }}-plan   # Read-only AWS role
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_PLAN_ROLE_{0}', upper(matrix.env))] }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: environments/${{ matrix.env }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: environments/${{ matrix.env }}
+        run: |
+          terraform plan -input=false -no-color -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        env:
+          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN }}
+          TF_VAR_app_hostname:        ${{ secrets.APP_HOSTNAME }}
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/${{ matrix.env }}/plan.txt', 'utf8');
+            const MAX = 65000;
+            const truncated = plan.length > MAX
+              ? plan.substring(0, MAX) + '\n\n... truncated ...'
+              : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Terraform Plan — \`${{ matrix.env }}\`\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+  # -------------------------------------------------------------------------
+  # Apply dev — automatic on merge to main
+  # -------------------------------------------------------------------------
+  apply-dev:
+    name: Apply (dev)
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_DEV }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - run: terraform init -input=false
+        working-directory: environments/dev
+
+      - run: terraform apply -auto-approve -input=false
+        working-directory: environments/dev
+
+  # -------------------------------------------------------------------------
+  # Apply uat — manual approval gate (GitHub Environment protection rule)
+  # -------------------------------------------------------------------------
+  apply-uat:
+    name: Apply (uat)
+    needs: apply-dev
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: uat   # <-- Configure required reviewers in GitHub repo settings
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_UAT }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - run: terraform init -input=false
+        working-directory: environments/uat
+
+      - run: terraform apply -auto-approve -input=false
+        working-directory: environments/uat
+
+  # -------------------------------------------------------------------------
+  # Apply prod — second manual approval gate
+  # -------------------------------------------------------------------------
+  apply-prod:
+    name: Apply (prod)
+    needs: apply-uat
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: prod  # <-- Configure required reviewers in GitHub repo settings
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_PROD }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - run: terraform init -input=false
+        working-directory: environments/prod
+
+      - run: terraform apply -auto-approve -input=false
+        working-directory: environments/prod
+        env:
+          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN }}
+          TF_VAR_app_hostname:        ${{ secrets.APP_HOSTNAME }}
